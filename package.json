@@ -1,0 +1,12 @@
+{
+  "name": "portal-turma-licenciatura",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/helpers.test.mjs tests/validation.test.mjs tests/store.test.mjs tests/demo.test.mjs && node tests/render-smoke.mjs",
+    "check": "node --check docs/js/app.js && node --check docs/js/service.js && node --check docs/js/store.js && node --check docs/js/validation.js && node --check docs/js/demo.js",
+    "preview": "node preview.mjs",
+    "test:rules": "firebase emulators:exec --only firestore --project demo-portal-spark \"node --test tests/firestore.rules.test.mjs\""
+  }
+}

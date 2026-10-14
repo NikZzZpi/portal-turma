@@ -1,0 +1,365 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /classes/turma-licenciatura {
+      function docPath(entity, id) {
+        return /databases/$(database)/documents/classes/turma-licenciatura/$(entity)/$(id);
+      }
+      function verified() {
+        return request.auth != null && request.auth.token.email_verified == true
+          && request.auth.token.email is string;
+      }
+      function ownMember() { return get(docPath('members', request.auth.uid)).data; }
+      function active() {
+        return verified() && exists(docPath('members', request.auth.uid))
+          && ownMember().active == true
+          && ownMember().email == request.auth.token.email.lower();
+      }
+      function ownerIdentity() {
+        return verified() && get(docPath('config','access')).data.ownerUid == request.auth.uid;
+      }
+      function owner() { return active() && ownerIdentity() && ownMember().role == 'owner'; }
+      function admin() {
+        return active() && (ownMember().role == 'admin'
+          || (ownMember().role == 'owner' && ownerIdentity()));
+      }
+      function text(value, maximum) { return value is string && value.size() <= maximum; }
+      function nonempty(value, maximum) { return text(value, maximum) && value.size() > 0; }
+      function identifier(value) { return text(value,128) && value.matches('^[A-Za-z0-9_-]*$'); }
+      function url(value) {
+        return text(value,2000) && (value == '' || value.matches('^https?://[^\\s]+$'));
+      }
+      function day(value, optional) {
+        return value is string && ((optional && value == '')
+          || value.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$'));
+      }
+      function metadataFields() {
+        return ['id','version','createdAt','createdBy','updatedAt','updatedBy','lastOperation'];
+      }
+      function operationMatches(key) {
+        let operation = getAfter(docPath('operations',key)).data;
+        let audit = getAfter(docPath('audit',key)).data;
+        return nonempty(key,260) && operation.id == key && audit.id == key
+          && operation.actorId == request.auth.uid && audit.actorId == request.auth.uid
+          && operation.action == audit.action
+          && operation.createdAt == request.time && audit.createdAt == request.time;
+      }
+      function metadata(d,id,creating) {
+        return d.keys().hasAll(metadataFields()) && d.id == id
+          && d.version is int && d.version > 0
+          && d.updatedAt == request.time && d.updatedBy == request.auth.uid
+          && operationMatches(d.lastOperation)
+          && (creating
+            ? d.version == 1 && d.createdAt == request.time && d.createdBy == request.auth.uid
+            : d.version == resource.data.version + 1
+              && d.createdAt == resource.data.createdAt && d.createdBy == resource.data.createdBy);
+      }
+      function memberShape(d,id) {
+        return d.keys().hasOnly(metadataFields().concat(['name','email','role','active']))
+          && d.keys().hasAll(['id','name','email','role','active','version','createdAt','createdBy','updatedAt','updatedBy'])
+          && d.id == id && nonempty(d.name,120) && nonempty(d.email,254)
+          && d.email == d.email.lower() && d.role in ['owner','admin','student']
+          && d.active is bool && d.version is int;
+      }
+      function initialMember(d,id) {
+        let email = request.auth.token.email.lower();
+        return verified() && id == request.auth.uid && memberShape(d,id)
+          && d.email == email && d.active == true && d.version == 1
+          && d.createdAt == request.time && d.updatedAt == request.time
+          && d.createdBy == id && d.updatedBy == id
+          && (ownerIdentity() ? d.role == 'owner'
+            : get(docPath('invites',email)).data.status == 'pending'
+              && get(docPath('invites',email)).data.role == d.role
+              && get(docPath('invites',email)).data.name == d.name
+              && getAfter(docPath('invites',email)).data.status == 'accepted'
+              && getAfter(docPath('invites',email)).data.acceptedBy == id);
+      }
+      function inviteShape(d,email) {
+        return d.keys().hasOnly(metadataFields().concat(['email','name','role','status','acceptedBy','acceptedAt']))
+          && d.id == email && d.email == email && email == email.lower()
+          && nonempty(email,254) && nonempty(d.name,120)
+          && d.role in ['admin','student'] && d.status in ['pending','accepted','revoked'];
+      }
+      function claimInvite(d,email) {
+        let member = getAfter(docPath('members',request.auth.uid)).data;
+        return verified() && email == request.auth.token.email.lower()
+          && resource.data.status == 'pending' && d.status == 'accepted'
+          && !exists(docPath('members',request.auth.uid))
+          && d.diff(resource.data).affectedKeys().hasOnly(['status','acceptedBy','acceptedAt','updatedAt','updatedBy','version'])
+          && d.acceptedBy == request.auth.uid && d.acceptedAt == request.time
+          && d.updatedAt == request.time && d.updatedBy == request.auth.uid
+          && d.version == resource.data.version + 1
+          && member.id == request.auth.uid && member.email == email
+          && member.role == resource.data.role && member.name == resource.data.name
+          && member.active == true && member.createdAt == request.time;
+      }
+      function official(entity) {
+        return entity in ['semesters','subjects','teachers','schedules','notices','events','materials','groups','goals','news'];
+      }
+      function readable(entity,d) {
+        return entity == 'semesters'
+          || (entity == 'events' && d.status in ['published','cancelled'])
+          || (entity in ['groups','goals'] && d.status in ['published','closed'])
+          || d.status == 'published';
+      }
+      function allowedFields(entity) {
+        return metadataFields().concat(['previousStatus','clonedFrom','sourceRequestId']).concat(
+          entity == 'semesters' ? ['title','startDate','endDate','status'] :
+          entity == 'subjects' ? ['title','description','semesterId','teacherIds','platformUrl','links','sourceCheckedDate','room','status'] :
+          entity == 'teachers' ? ['title','email','contact','officeHours','platformUrl','links','sourceCheckedDate','description','status'] :
+          entity == 'schedules' ? ['title','subjectId','semesterId','weekday','time','endTime','room','status'] :
+          entity == 'notices' ? ['title','description','semesterId','subjectId','category','sourceUrl','eventId','pinned','important','expiresDate','status'] :
+          entity == 'events' ? ['title','description','semesterId','subjectId','kind','eventState','date','time','allDay','endDate','endTime','location','sourceUrl','changeReason','status'] :
+          entity == 'materials' ? ['title','description','semesterId','subjectId','category','sourceUrl','authorName','status'] :
+          entity == 'groups' ? ['title','description','semesterId','subjectId','date','time','location','sourceUrl','organizer','status'] :
+          entity == 'goals' ? ['title','description','targetCents','date','status'] :
+          ['title','description','eventId','semesterId','status']);
+      }
+      function officialShape(entity,d) {
+        return d.keys().hasOnly(allowedFields(entity)) && nonempty(d.title,120)
+          && text(d.get('description',''),5000)
+          && identifier(d.get('semesterId','')) && identifier(d.get('subjectId',''))
+          && url(d.get('sourceUrl','')) && url(d.get('platformUrl',''))
+          && d.get('links',[]) is list && d.get('links',[]).size() <= 10
+          && d.get('teacherIds',[]) is list && d.get('teacherIds',[]).size() <= 10
+          && (entity in ['semesters','subjects','teachers','schedules','news'] ? d.status in ['published','archived']
+            : entity == 'events' ? d.status in ['draft','published','cancelled','archived']
+            : entity in ['groups','goals'] ? d.status in ['draft','published','closed','archived']
+            : d.status in ['draft','published','archived'])
+          && (entity != 'goals' || (d.targetCents is int && d.targetCents > 0 && d.targetCents <= 100000000))
+          && (entity != 'events' || (day(d.date,false) && d.allDay is bool
+            && d.kind in ['exam','assignment','activity','presentation','meeting','university']
+            && d.eventState in ['planned','confirmed','completed']))
+          && (entity != 'semesters' || (day(d.startDate,false) && day(d.endDate,false) && d.endDate >= d.startDate));
+      }
+      function publicationLinked(entity,d,id) {
+        let requestId = d.get('sourceRequestId','');
+        return requestId == '' || (entity in ['notices','events','materials','groups']
+          && getAfter(docPath('requests',requestId)).data.status == 'approved'
+          && getAfter(docPath('requests',requestId)).data.publishedEntity == entity
+          && getAfter(docPath('requests',requestId)).data.publishedId == id
+          && getAfter(docPath('requests',requestId)).data.type in ['notice','event','material','group']);
+      }
+      function semesterArchive(entity,d,id) {
+        return entity != 'semesters' || d.status != 'archived'
+          || !exists(docPath('meta','settings'))
+          || getAfter(docPath('meta','settings')).data.activeSemesterId != id;
+      }
+      function requestFields() {
+        return metadataFields().concat(['title','description','type','semesterId','subjectId','sourceUrl','relatedId','parentId','authorId','authorName','status','response','publishedId','publishedEntity','reviewedBy','reviewedAt']);
+      }
+      function requestShape(d) {
+        return d.keys().hasOnly(requestFields()) && nonempty(d.title,120)
+          && nonempty(d.description,5000) && url(d.sourceUrl)
+          && d.type in ['notice','event','material','group','correction','finance','support']
+          && nonempty(d.semesterId,128) && identifier(d.semesterId)
+          && identifier(d.subjectId) && identifier(d.relatedId) && identifier(d.parentId)
+          && nonempty(d.authorId,128) && nonempty(d.authorName,120)
+          && text(d.response,3000) && identifier(d.publishedId)
+          && d.publishedEntity in ['','notices','events','materials','groups']
+          && d.status in ['pending','reviewing','awaiting','rejected','cancelled','approved'];
+      }
+      function requestCounter(id) {
+        let limit = getAfter(docPath('requestLimits',request.auth.uid)).data;
+        return limit.lastRequestId == id && limit.day == request.time.date()
+          && limit.updatedAt == request.time && limit.count > 0 && limit.count <= 10;
+      }
+      function reviewed(d,id) {
+        return !(resource.data.status in ['approved','rejected','cancelled'])
+          && d.diff(resource.data).affectedKeys().hasOnly(['status','response','publishedId','publishedEntity','reviewedBy','reviewedAt','version','updatedAt','updatedBy','lastOperation'])
+          && d.status in ['reviewing','awaiting','rejected','cancelled','approved']
+          && d.reviewedBy == request.auth.uid
+          && (d.status == 'reviewing' || d.response.size() > 0)
+          && (d.status != 'approved' ? d.publishedId == '' && d.publishedEntity == ''
+            : d.type in ['finance','support','correction'] ? d.publishedId == '' && d.publishedEntity == ''
+            : d.publishedEntity in ['notices','events','materials','groups'] && d.publishedId != ''
+              && !exists(docPath(d.publishedEntity,d.publishedId))
+              && getAfter(docPath(d.publishedEntity,d.publishedId)).data.sourceRequestId == id
+              && getAfter(docPath(d.publishedEntity,d.publishedId)).data.status == 'published'
+              && getAfter(docPath(d.publishedEntity,d.publishedId)).data.semesterId == d.semesterId
+              && getAfter(docPath(d.publishedEntity,d.publishedId)).data.lastOperation == d.lastOperation);
+      }
+      function ledgerShape(d,id) {
+        return d.keys().hasOnly(metadataFields().concat(['title','date','type','amountCents','deltaCents','incomeDeltaCents','expenseDeltaCents','category','goalId','description','reversalOf','reversedBy','reason']))
+          && nonempty(d.title,120) && day(d.date,false) && d.type in ['income','expense']
+          && d.amountCents is int && d.amountCents > 0 && d.amountCents <= 100000000
+          && d.deltaCents is int && d.incomeDeltaCents is int && d.expenseDeltaCents is int
+          && nonempty(d.category,120) && identifier(d.goalId) && text(d.description,5000)
+          && identifier(d.reversalOf) && identifier(d.reversedBy) && text(d.reason,1000);
+      }
+      function originalLedger(d) {
+        return d.reversalOf == '' && d.reversedBy == '' && d.reason == ''
+          && (d.type == 'income'
+            ? d.deltaCents == d.amountCents && d.incomeDeltaCents == d.amountCents && d.expenseDeltaCents == 0
+            : d.deltaCents == -d.amountCents && d.incomeDeltaCents == 0 && d.expenseDeltaCents == d.amountCents);
+      }
+      function reversingLedger(d,id) {
+        let original = get(docPath('ledger',d.reversalOf)).data;
+        let after = getAfter(docPath('ledger',d.reversalOf)).data;
+        return d.reversalOf != '' && id == d.reversalOf + '_reverse'
+          && original.reversalOf == '' && original.reversedBy == ''
+          && after.reversedBy == id && after.lastOperation == d.lastOperation
+          && d.reversedBy == '' && d.reason.size() > 0 && d.amountCents == original.amountCents
+          && d.deltaCents == -original.deltaCents && d.incomeDeltaCents == -original.incomeDeltaCents
+          && d.expenseDeltaCents == -original.expenseDeltaCents && d.goalId == original.goalId
+          && d.type == (original.type == 'income' ? 'expense' : 'income');
+      }
+      function markReversed(d,id) {
+        let reversalId = id + '_reverse';
+        let reversal = getAfter(docPath('ledger',reversalId)).data;
+        return resource.data.reversalOf == '' && resource.data.reversedBy == ''
+          && d.diff(resource.data).affectedKeys().hasOnly(['reversedBy','updatedAt','updatedBy','version','lastOperation'])
+          && d.reversedBy == reversalId && !exists(docPath('ledger',reversalId))
+          && reversal.reversalOf == id && reversal.lastOperation == d.lastOperation
+          && reversal.createdAt == request.time;
+      }
+
+      match /config/access {
+        allow get: if verified();
+        allow list, create, update, delete: if false;
+      }
+      match /members/{uid} {
+        allow get: if verified() && (request.auth.uid == uid || admin());
+        allow list: if admin();
+        allow create: if initialMember(request.resource.data,uid);
+        allow update: if owner() && uid != get(docPath('config','access')).data.ownerUid
+          && memberShape(request.resource.data,uid) && metadata(request.resource.data,uid,false)
+          && request.resource.data.role in ['admin','student']
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role','active','version','updatedAt','updatedBy','lastOperation']);
+        allow delete: if false;
+      }
+      match /invites/{email} {
+        allow get: if verified() && (email == request.auth.token.email.lower() || owner());
+        allow list: if owner();
+        allow create: if owner() && inviteShape(request.resource.data,email)
+          && request.resource.data.status == 'pending' && metadata(request.resource.data,email,true);
+        allow update: if inviteShape(request.resource.data,email) && (claimInvite(request.resource.data,email)
+          || (owner() && resource.data.status != 'accepted'
+            && request.resource.data.status in ['pending','revoked'] && metadata(request.resource.data,email,false)));
+        allow delete: if false;
+      }
+      match /operations/{operationId} {
+        allow get: if active() && (!exists(docPath('operations',operationId)) || resource.data.actorId == request.auth.uid);
+        allow list, update, delete: if false;
+        allow create: if active()
+          && request.resource.data.keys().hasOnly(['id','actorId','action','signature','result','createdAt'])
+          && request.resource.data.id == operationId && request.resource.data.actorId == request.auth.uid
+          && nonempty(request.resource.data.action,30) && nonempty(request.resource.data.signature,200000)
+          && request.resource.data.result is map && request.resource.data.result.size() <= 10
+          && request.resource.data.createdAt == request.time
+          && getAfter(docPath('audit',operationId)).data.actorId == request.auth.uid
+          && getAfter(docPath('audit',operationId)).data.action == request.resource.data.action
+          && getAfter(docPath('audit',operationId)).data.createdAt == request.time;
+      }
+      match /audit/{operationId} {
+        allow read: if admin();
+        allow update, delete: if false;
+        allow create: if active()
+          && request.resource.data.keys().hasOnly(['id','actorId','actorName','action','entity','recordId','details','createdAt'])
+          && request.resource.data.id == operationId && request.resource.data.actorId == request.auth.uid
+          && request.resource.data.actorName == ownMember().name
+          && request.resource.data.createdAt == request.time
+          && nonempty(request.resource.data.action,30) && text(request.resource.data.details,3000)
+          && request.resource.data.entity in ['semesters','subjects','teachers','schedules','notices','events','materials','groups','goals','news','requests','ledger','members','invites','settings']
+          && operationMatches(operationId)
+          && (admin() || (request.resource.data.action == 'request' && request.resource.data.entity == 'requests'
+            && getAfter(docPath('requests',request.resource.data.recordId)).data.authorId == request.auth.uid))
+          && getAfter(docPath(request.resource.data.entity == 'settings' ? 'meta' : request.resource.data.entity,request.resource.data.recordId)).data.lastOperation == operationId;
+      }
+      match /meta/settings {
+        allow read: if active();
+        allow create, update: if admin()
+          && request.resource.data.keys().hasOnly(metadataFields().concat(['title','course','university','activeSemesterId','helpText']))
+          && nonempty(request.resource.data.title,120) && nonempty(request.resource.data.course,160)
+          && text(request.resource.data.university,160) && text(request.resource.data.helpText,3000)
+          && identifier(request.resource.data.activeSemesterId)
+          && (request.resource.data.activeSemesterId == ''
+            || getAfter(docPath('semesters',request.resource.data.activeSemesterId)).data.status == 'published')
+          && metadata(request.resource.data,'settings',!exists(docPath('meta','settings')));
+        allow delete: if false;
+      }
+      match /{entity}/{id} {
+        allow read: if official(entity) && active() && (admin() || readable(entity,resource.data));
+        allow create: if official(entity) && admin() && officialShape(entity,request.resource.data)
+          && metadata(request.resource.data,id,true) && publicationLinked(entity,request.resource.data,id)
+          && semesterArchive(entity,request.resource.data,id);
+        allow update: if official(entity) && admin() && officialShape(entity,request.resource.data)
+          && metadata(request.resource.data,id,false) && semesterArchive(entity,request.resource.data,id)
+          && request.resource.data.get('sourceRequestId','') == resource.data.get('sourceRequestId','');
+        allow delete: if false;
+      }
+      match /requests/{id} {
+        allow read: if active() && (admin() || resource.data.authorId == request.auth.uid);
+        allow create: if active() && requestShape(request.resource.data) && metadata(request.resource.data,id,true)
+          && request.resource.data.authorId == request.auth.uid && request.resource.data.authorName == ownMember().name
+          && request.resource.data.status == 'pending' && request.resource.data.response == ''
+          && request.resource.data.publishedId == '' && request.resource.data.publishedEntity == ''
+          && request.resource.data.get('reviewedBy','') == '' && requestCounter(id)
+          && (request.resource.data.parentId == '' || admin()
+            || get(docPath('requests',request.resource.data.parentId)).data.authorId == request.auth.uid);
+        allow update: if admin() && requestShape(request.resource.data)
+          && metadata(request.resource.data,id,false) && reviewed(request.resource.data,id);
+        allow delete: if false;
+      }
+      match /requestLimits/{uid} {
+        allow get: if active() && request.auth.uid == uid;
+        allow list, delete: if false;
+        allow create, update: if active() && request.auth.uid == uid
+          && request.resource.data.keys().hasOnly(['day','count','lastRequestId','updatedAt'])
+          && request.resource.data.day == request.time.date() && request.resource.data.updatedAt == request.time
+          && request.resource.data.count is int && request.resource.data.count >= 1 && request.resource.data.count <= 10
+          && (exists(docPath('requestLimits',uid)) && resource.data.day == request.time.date()
+            ? request.resource.data.count == resource.data.count + 1 : request.resource.data.count == 1)
+          && !exists(docPath('requests',request.resource.data.lastRequestId))
+          && getAfter(docPath('requests',request.resource.data.lastRequestId)).data.authorId == uid
+          && getAfter(docPath('requests',request.resource.data.lastRequestId)).data.createdAt == request.time;
+      }
+      match /personal/{uid} {
+        allow get: if active() && request.auth.uid == uid;
+        allow list, delete: if false;
+        allow create, update: if active() && request.auth.uid == uid
+          && request.resource.data.keys().hasOnly(['id','favorites','tasks','read','preferences','updatedAt'])
+          && request.resource.data.id == uid && request.resource.data.updatedAt == request.time
+          && request.resource.data.favorites is list && request.resource.data.favorites.size() <= 500
+          && request.resource.data.tasks is map && request.resource.data.tasks.size() <= 1000
+          && request.resource.data.read is map && request.resource.data.read.size() <= 1000
+          && request.resource.data.preferences is map
+          && request.resource.data.preferences.keys().hasOnly(['theme','subjectId','initialView'])
+          && request.resource.data.preferences.get('theme','light') in ['light','dark']
+          && request.resource.data.preferences.get('initialView','home') in ['home','calendar','subjects']
+          && identifier(request.resource.data.preferences.get('subjectId',''));
+      }
+      match /noticeReads/{readId} {
+        allow read: if active() && (admin() || resource.data.memberId == request.auth.uid);
+        allow create, update: if active()
+          && request.resource.data.keys().hasOnly(['memberId','memberName','noticeId','version','updatedAt'])
+          && readId == request.auth.uid + '_' + request.resource.data.noticeId
+          && request.resource.data.memberId == request.auth.uid && request.resource.data.memberName == ownMember().name
+          && request.resource.data.updatedAt == request.time && request.resource.data.version is int
+          && get(docPath('notices',request.resource.data.noticeId)).data.status == 'published'
+          && get(docPath('notices',request.resource.data.noticeId)).data.important == true
+          && get(docPath('notices',request.resource.data.noticeId)).data.version == request.resource.data.version;
+        allow delete: if false;
+      }
+      match /ledger/{id} {
+        allow read: if active();
+        allow create: if admin() && ledgerShape(request.resource.data,id) && metadata(request.resource.data,id,true)
+          && (originalLedger(request.resource.data) || reversingLedger(request.resource.data,id));
+        allow update: if admin() && ledgerShape(request.resource.data,id)
+          && metadata(request.resource.data,id,false) && markReversed(request.resource.data,id);
+        allow delete: if false;
+      }
+      match /ledgerPrivate/{id} {
+        allow read: if active() && (admin() || resource.data.contributorId == request.auth.uid);
+        allow create: if admin()
+          && request.resource.data.keys().hasOnly(['contributorId','receiptUrl','createdAt','createdBy'])
+          && identifier(request.resource.data.contributorId) && url(request.resource.data.receiptUrl)
+          && request.resource.data.createdAt == request.time && request.resource.data.createdBy == request.auth.uid
+          && getAfter(docPath('ledger',id)).data.createdAt == request.time
+          && getAfter(docPath('ledger',id)).data.createdBy == request.auth.uid;
+        allow update, delete: if false;
+      }
+    }
+    match /{document=**} { allow read, write: if false; }
+  }
+}
